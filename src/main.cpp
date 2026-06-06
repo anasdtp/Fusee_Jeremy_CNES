@@ -12,11 +12,13 @@ using namespace std::chrono;
 
 // Pin mapping based on the provided schematic labels.
 // Adjust these constants when the PCB routing is finalized.
-static constexpr PinName PIN_SW_SYSTEM = D4;
 static constexpr PinName PIN_SW_CALCULO = D2;
-static constexpr PinName PIN_SW_EXPERIENCE = D3;
+// PIN_SW_EXPERIENCE (D3) est reutilisee temporairement comme BP_SERVO
+// car le bouton BP_SERVO n'a pas ete cable sur la carte v1.
+// A corriger lors du prochain routage PCB (voir README).
+static constexpr PinName PIN_SW_EXPERIENCE = D3; // reserve pour la carte experience (v2)
 static constexpr PinName PIN_JACK_TRG = D5;
-static constexpr PinName PIN_BP_SERVO = D8;
+static constexpr PinName PIN_BP_SERVO = D3;      // WORKAROUND v1: partage la pin SW_EXPERIENCE
 static constexpr PinName PIN_LED_EXP = D6;
 static constexpr PinName PIN_LED_JACK = D7;
 static constexpr PinName PIN_SERVO = D9;
@@ -27,8 +29,8 @@ static constexpr uint32_t LOOP_PERIOD_MS = 5;
 static constexpr uint32_t DELAI_SERVO_MS = 5000;
 static constexpr uint32_t BLINK_MS = 300;
 
-static constexpr int SERVO_REST_DEG = 0;
-static constexpr int SERVO_OPEN_DEG = 90;
+static constexpr int SERVO_REST_DEG = 0; // Position repos
+static constexpr int SERVO_OPEN_DEG = 90; // Position ouverte  (Valeurs à confirmer lors de l'intégration)
 static constexpr int SERVO_MIN_PULSE_US = 1000;
 static constexpr int SERVO_MAX_PULSE_US = 2000;
 
@@ -55,19 +57,15 @@ enum class ActiveMode {
     EXPERIENCE
 };
 
-static uint32_t nowMs() {
-    // Horloge monotone mbed convertie en millisecondes.
-    return duration_cast<milliseconds>(Kernel::Clock::now().time_since_epoch()).count();
-}
-
 int main() {
     // UART = console de diagnostic pour comprendre ce que fait l'automate.
     UartLogger uart(USBTX, USBRX, 115200);
 
     // Chaque entree passe par un filtre anti-rebond logiciel.
-    DebouncedInput swSystem(PIN_SW_SYSTEM, INPUT_ACTIVE_LOW, DEBOUNCE_MS);
     DebouncedInput swCalculo(PIN_SW_CALCULO, INPUT_ACTIVE_LOW, DEBOUNCE_MS);
-    DebouncedInput swExperience(PIN_SW_EXPERIENCE, INPUT_ACTIVE_LOW, DEBOUNCE_MS);
+    // DebouncedInput swExperience(PIN_SW_EXPERIENCE, INPUT_ACTIVE_LOW, DEBOUNCE_MS);
+    // swExperience desactive en v1: D3 est reutilisee comme BP_SERVO (workaround).
+    // A restaurer quand la carte experience sera couplee.
     DebouncedInput jackTrig(PIN_JACK_TRG, INPUT_ACTIVE_LOW, DEBOUNCE_MS);
     DebouncedInput bpServo(PIN_BP_SERVO, INPUT_ACTIVE_LOW, DEBOUNCE_MS);
 
@@ -92,6 +90,14 @@ int main() {
     bool lastJackPresent = false;
 
     uart.info("[INFO] Boot system");
+    // Test LEDs au demarrage (spec §13 etape 4).
+    uart.info("[INFO] LED test...");
+    ledExp = 1; // Allume les 2 LEDs pour verifier leur bon fonctionnement.
+    ledJack = 1;
+    ThisThread::sleep_for(milliseconds(500));
+    ledExp = 0;
+    ledJack = 0;
+    uart.info("[INFO] LED test OK");
     servo.writeAngle(SERVO_REST_DEG);
     uart.info("[INFO] Servo closed");
     state = SystemState::ATTENTE;
@@ -99,18 +105,17 @@ int main() {
     while (true) {
         // --- Etape 1: acquisition des entrees ---
         const auto nowTp = Kernel::Clock::now();
-        const uint32_t now = nowMs();
+        const uint32_t now = duration_cast<milliseconds>(nowTp.time_since_epoch()).count();
 
-        swSystem.update(nowTp);
         swCalculo.update(nowTp);
-        swExperience.update(nowTp);
+        // swExperience.update(nowTp);
         jackTrig.update(nowTp);
         bpServo.update(nowTp);
 
-        const bool systemOn = swSystem.isActive();
         const bool jackPresent = jackTrig.isActive();
         const bool calculoOn = swCalculo.isActive();
-        const bool experienceOn = swExperience.isActive();
+        // experienceOn toujours false en v1 (carte experience non couplee, pin D3 = BP_SERVO).
+        const bool experienceOn = false; // swExperience.isActive(); // A activer en v2 quand la carte experience sera connectee.
 
         // Log uniquement sur changement pour eviter le spam UART.
         if (jackPresent != lastJackPresent) {
@@ -120,30 +125,6 @@ int main() {
             } else {
                 uart.info("[INFO] Jack removed");
             }
-        }
-
-        if (!systemOn) {
-            // Arret prioritaire: on coupe tout et on revient en etat propre.
-            if (state != SystemState::ARRET) {
-                uart.info("[INFO] System OFF -> ARRET");
-            }
-
-            state = SystemState::ARRET;
-            mode = ActiveMode::NONE;
-            timerRunning = false;
-            ledExpBlink = false;
-            ledJackBlink = false;
-            ledExp = 0;
-            ledJack = 0;
-
-            if (servoOpen) {
-                servoOpen = false;
-                servo.writeAngle(SERVO_REST_DEG);
-                uart.info("[INFO] Servo closed");
-            }
-
-            ThisThread::sleep_for(milliseconds(LOOP_PERIOD_MS));
-            continue;
         }
 
         // Jack safety has priority and cancels any ongoing sequence immediately.
@@ -174,6 +155,8 @@ int main() {
                 uart.info("[ERROR] Invalid mode: CALCULO and EXPERIENCE active");
             }
             ledJackBlink = true;
+            timerRunning = false;
+            ledExpBlink = false;
             mode = ActiveMode::NONE;
             state = SystemState::ATTENTE;
         } else {
@@ -202,7 +185,7 @@ int main() {
             }
         }
 
-        const bool autoConditions = systemOn && jackPresent && mode != ActiveMode::NONE;
+        const bool autoConditions = jackPresent && mode != ActiveMode::NONE;
         if (autoConditions && !timerRunning && !servoOpen) {
             // Demarrage one-shot de la tempo automatique.
             timerRunning = true;
@@ -224,7 +207,7 @@ int main() {
 
         if (bpServo.rose()) {
             // Mode bascule manuel: chaque appui inverse l'etat du servo.
-            if (systemOn && jackPresent) {
+            if (jackPresent) {
                 timerRunning = false;
                 ledExpBlink = false;
 
@@ -239,7 +222,7 @@ int main() {
                     uart.info("[INFO] Servo closed");
                 }
             } else {
-                uart.info("[WARN] BP_SERVO ignored: safety conditions not met");
+                uart.info("[WARN] BP_SERVO ignored: jack absent");
             }
         }
 
@@ -256,10 +239,8 @@ int main() {
                           static_cast<int>(timerRunning),
                           servo.lastAngle());
             } else if (command == 'i' || command == 'I') {
-                uart.info("[MAINT] Inputs System=%d Calculo=%d Experience=%d Jack=%d BP=%d",
-                          static_cast<int>(systemOn),
+                uart.info("[MAINT] Inputs Calculo=%d Jack=%d BP=%d",
                           static_cast<int>(calculoOn),
-                          static_cast<int>(experienceOn),
                           static_cast<int>(jackPresent),
                           static_cast<int>(bpServo.isActive()));
             } else if (command == 'o' || command == 'O') {
